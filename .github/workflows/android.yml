@@ -40,12 +40,36 @@ jobs:
           unzip -q ODialer-MotoG85-starter.zip -d /tmp/odialer-src
           cp -a /tmp/odialer-src/ODialer-MotoG85/. .
 
+      - name: Add Contacts permission
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          path = "app/src/main/AndroidManifest.xml"
+          ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
+          ns = "{http://schemas.android.com/apk/res/android}"
+
+          tree = ET.parse(path)
+          root = tree.getroot()
+
+          permission = "android.permission.READ_CONTACTS"
+          if not any(
+              item.get(ns + "name") == permission
+              for item in root.findall("uses-permission")
+          ):
+              ET.SubElement(root, "uses-permission", {ns + "name": permission})
+
+          tree.write(path, encoding="utf-8", xml_declaration=True)
+          PY
+
       - name: Create new Dialer interface
         run: |
           cat > app/src/main/java/com/motog85/odialer/MainActivity.kt <<'EOF'
           package com.motog85.odialer
 
+          import android.Manifest
           import android.content.Intent
+          import android.content.pm.PackageManager
           import android.net.Uri
           import android.os.Bundle
           import android.provider.ContactsContract
@@ -54,6 +78,8 @@ jobs:
           import androidx.compose.foundation.background
           import androidx.compose.foundation.clickable
           import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
           import androidx.compose.foundation.shape.CircleShape
           import androidx.compose.material3.*
           import androidx.compose.runtime.*
@@ -68,8 +94,20 @@ jobs:
 
           class MainActivity : ComponentActivity() {
 
+              private val savedContacts =
+                  mutableStateListOf<Pair<String, String>>()
+
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+
+                  if (checkSelfPermission(Manifest.permission.READ_CONTACTS)
+                      == PackageManager.PERMISSION_GRANTED) {
+                      loadContacts()
+                  } else {
+                      requestPermissions(
+                          arrayOf(Manifest.permission.READ_CONTACTS), 101
+                      )
+                  }
 
                   setContent {
                       var number by remember { mutableStateOf("") }
@@ -83,6 +121,18 @@ jobs:
 
                       val lightGray = Color(0xFFF1F1F1)
                       val green = Color(0xFF00C967)
+
+                      val search = number.filter { it.isDigit() }
+
+                      val suggestions = if (search.isNotEmpty()) {
+                          savedContacts.filter { contact ->
+                              val phone = contact.second.filter { it.isDigit() }
+                              phone.startsWith(search) ||
+                                  contact.first.contains(number, ignoreCase = true)
+                          }.take(5)
+                      } else {
+                          emptyList()
+                      }
 
                       MaterialTheme {
                           Surface(
@@ -98,14 +148,19 @@ jobs:
                                       modifier = Modifier
                                           .fillMaxWidth()
                                           .padding(top = 24.dp),
-                                      horizontalArrangement = Arrangement.SpaceBetween,
-                                      verticalAlignment = Alignment.CenterVertically
+                                      horizontalArrangement =
+                                          Arrangement.SpaceBetween,
+                                      verticalAlignment =
+                                          Alignment.CenterVertically
                                   ) {
                                       CircleAction("‹", lightGray) {
                                           number = ""
                                       }
 
-                                      Row(verticalAlignment = Alignment.CenterVertically) {
+                                      Row(
+                                          verticalAlignment =
+                                              Alignment.CenterVertically
+                                      ) {
                                           CircleAction("⌕", lightGray) {
                                               try {
                                                   startActivity(
@@ -132,7 +187,7 @@ jobs:
                                       contentAlignment = Alignment.Center
                                   ) {
                                       Text(
-                                          text = number.ifEmpty { "" },
+                                          text = number,
                                           fontSize = 30.sp,
                                           color = Color.Black,
                                           fontWeight = FontWeight.Medium,
@@ -140,9 +195,87 @@ jobs:
                                       )
                                   }
 
+                                  if (suggestions.isNotEmpty()) {
+                                      Text(
+                                          "CONTACT SUGGESTIONS",
+                                          modifier = Modifier.padding(
+                                              start = 8.dp, bottom = 5.dp
+                                          ),
+                                          fontSize = 12.sp,
+                                          color = Color.Gray,
+                                          fontWeight = FontWeight.Bold
+                                      )
+
+                                      LazyColumn(
+                                          modifier = Modifier
+                                              .fillMaxWidth()
+                                              .heightIn(max = 125.dp)
+                                      ) {
+                                          items(suggestions) { contact ->
+                                              Row(
+                                                  modifier = Modifier
+                                                      .fillMaxWidth()
+                                                      .clickable {
+                                                          number = contact.second
+                                                      }
+                                                      .padding(
+                                                          horizontal = 8.dp,
+                                                          vertical = 7.dp
+                                                      ),
+                                                  verticalAlignment =
+                                                      Alignment.CenterVertically
+                                              ) {
+                                                  Box(
+                                                      modifier = Modifier
+                                                          .size(38.dp)
+                                                          .clip(CircleShape)
+                                                          .background(
+                                                              Color(0xFFE8EEF8)
+                                                          ),
+                                                      contentAlignment =
+                                                          Alignment.Center
+                                                  ) {
+                                                      Text(
+                                                          contact.first
+                                                              .take(1)
+                                                              .uppercase(),
+                                                          color = Color(0xFF315A91),
+                                                          fontWeight =
+                                                              FontWeight.Bold
+                                                      )
+                                                  }
+
+                                                  Column(
+                                                      modifier = Modifier
+                                                          .weight(1f)
+                                                          .padding(start = 12.dp)
+                                                  ) {
+                                                      Text(
+                                                          contact.first,
+                                                          color = Color.Black,
+                                                          fontWeight =
+                                                              FontWeight.SemiBold
+                                                      )
+                                                      Text(
+                                                          contact.second,
+                                                          color = Color.Gray,
+                                                          fontSize = 13.sp
+                                                      )
+                                                  }
+                                                  Text(
+                                                      "›",
+                                                      fontSize = 25.sp,
+                                                      color = Color.Gray
+                                                  )
+                                              }
+                                          }
+                                      }
+                                  }
+
                                   Column(
                                       modifier = Modifier.fillMaxWidth(),
-                                      horizontalAlignment = Alignment.CenterHorizontally
+                                      horizontalAlignment =
+                                          Alignment.CenterHorizontally
                                   ) {
                                       keys.forEach { row ->
                                           Row(
@@ -170,7 +303,8 @@ jobs:
                                                           item.first,
                                                           fontSize = 38.sp,
                                                           color = Color.Black,
-                                                          fontWeight = FontWeight.Medium
+                                                          fontWeight =
+                                                              FontWeight.Medium
                                                       )
 
                                                       if (item.second.isNotEmpty()) {
@@ -178,7 +312,8 @@ jobs:
                                                               item.second,
                                                               fontSize = 15.sp,
                                                               color = Color.DarkGray,
-                                                              fontWeight = FontWeight.Bold
+                                                              fontWeight =
+                                                                  FontWeight.Bold
                                                           )
                                                       }
                                                   }
@@ -190,10 +325,14 @@ jobs:
                                   Row(
                                       modifier = Modifier
                                           .fillMaxWidth()
-                                          .padding(top = 12.dp, bottom = 30.dp),
+                                          .padding(
+                                              top = 12.dp,
+                                              bottom = 30.dp
+                                          ),
                                       horizontalArrangement =
                                           Arrangement.SpaceEvenly,
-                                      verticalAlignment = Alignment.CenterVertically
+                                      verticalAlignment =
+                                          Alignment.CenterVertically
                                   ) {
                                       BottomAction("WhatsApp") {
                                           if (number.isNotBlank()) {
@@ -201,7 +340,9 @@ jobs:
                                                   startActivity(
                                                       Intent(
                                                           Intent.ACTION_VIEW,
-                                                          Uri.parse("https://wa.me/$number")
+                                                          Uri.parse(
+                                                              "https://wa.me/${number.filter { it.isDigit() }}"
+                                                          )
                                                       )
                                                   )
                                               } catch (_: Exception) {}
@@ -223,14 +364,15 @@ jobs:
                                                       )
                                                   }
                                               },
-                                          contentAlignment = Alignment.Center
+                                          contentAlignment =
+                                              Alignment.Center
                                       ) {
                                           Column(
                                               horizontalAlignment =
                                                   Alignment.CenterHorizontally
                                           ) {
                                               Text(
-                                                  "☎",
+                                                  "\u260E\uFE0E",
                                                   color = Color.White,
                                                   fontSize = 42.sp
                                               )
@@ -252,6 +394,59 @@ jobs:
                               }
                           }
                       }
+                  }
+              }
+
+              private fun loadContacts() {
+                  savedContacts.clear()
+
+                  try {
+                      val cursor = contentResolver.query(
+                          ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                          arrayOf(
+                              ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                              ContactsContract.CommonDataKinds.Phone.NUMBER
+                          ),
+                          null,
+                          null,
+                          ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME +
+                              " ASC"
+                      )
+
+                      cursor?.use {
+                          val nameIndex = it.getColumnIndex(
+                              ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME
+                          )
+                          val numberIndex = it.getColumnIndex(
+                              ContactsContract.CommonDataKinds.Phone.NUMBER
+                          )
+
+                          while (it.moveToNext()) {
+                              val name = it.getString(nameIndex) ?: ""
+                              val phone = it.getString(numberIndex) ?: ""
+
+                              if (name.isNotBlank() && phone.isNotBlank()) {
+                                  savedContacts.add(name to phone)
+                              }
+                          }
+                      }
+                  } catch (_: Exception) {}
+              }
+
+              override fun onRequestPermissionsResult(
+                  requestCode: Int,
+                  permissions: Array<out String>,
+                  grantResults: IntArray
+              ) {
+                  super.onRequestPermissionsResult(
+                      requestCode, permissions, grantResults
+                  )
+
+                  if (requestCode == 101 &&
+                      grantResults.isNotEmpty() &&
+                      grantResults[0] == PackageManager.PERMISSION_GRANTED
+                  ) {
+                      loadContacts()
                   }
               }
           }
@@ -292,7 +487,7 @@ jobs:
               ) {
                   Text(
                       label,
-                      fontSize = if (label == "⌫") 32.sp else 14.sp,
+                      fontSize = if (label == "⌫") 32.sp else 13.sp,
                       color = Color.Black,
                       fontWeight = FontWeight.Bold,
                       textAlign = TextAlign.Center
