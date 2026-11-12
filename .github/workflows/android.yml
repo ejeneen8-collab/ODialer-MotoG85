@@ -26,8 +26,7 @@ jobs:
 
       - name: Accept Android licenses and install SDK
         run: |
-          set -o pipefail
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-36" "build-tools;35.0.0" "platform-tools"
 
       - name: Set up Gradle
@@ -49,3 +48,4 @@ jobs:
         with:
           name: ODialer-MotoG85-APK
           path: app/build/outputs/apk/debug/app-debug.apk
+          
