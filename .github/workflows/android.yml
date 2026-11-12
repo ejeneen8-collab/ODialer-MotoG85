@@ -22,10 +22,19 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: ''
 
-      - name: Install Android SDK components
+      - name: Accept Android licenses
         run: |
-          yes | sdkmanager --licenses
+          mkdir -p "$ANDROID_HOME/licenses"
+          printf '%s\n' \
+            8933bad161af4178b1185d1a37fbf41ea5269c55 \
+            d56f5187479451eabf01fb78af6dfcb131a6481e \
+            24333f8a63b6825ea9c5514f83c2829b004d1fee \
+            84831b9409646a5f2b8a9f1e8f7f8f5f \
+            > "$ANDROID_HOME/licenses/android-sdk-license"
+          yes | sdkmanager --licenses || true
           sdkmanager "platforms;android-36" "build-tools;35.0.0"
 
       - name: Set up Gradle
