@@ -24,7 +24,7 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Accept Android licenses and install SDK
+      - name: Install Android SDK
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-36" "build-tools;35.0.0" "platform-tools"
@@ -40,7 +40,7 @@ jobs:
           unzip -q ODialer-MotoG85-starter.zip -d /tmp/odialer-src
           cp -a /tmp/odialer-src/ODialer-MotoG85/. .
 
-      - name: Add Contacts permission
+      - name: Configure Android Manifest
         run: |
           python3 - <<'PY'
           import xml.etree.ElementTree as ET
@@ -51,27 +51,67 @@ jobs:
 
           tree = ET.parse(path)
           root = tree.getroot()
+          app = root.find("application")
 
-          permission = "android.permission.READ_CONTACTS"
-          if not any(
-              item.get(ns + "name") == permission
-              for item in root.findall("uses-permission")
-          ):
-              ET.SubElement(root, "uses-permission", {ns + "name": permission})
+          for permission in [
+              "android.permission.READ_CONTACTS",
+              "android.permission.READ_CALL_LOG"
+          ]:
+              if not any(x.get(ns+"name") == permission for x in root.findall("uses-permission")):
+                  ET.SubElement(root, "uses-permission", {ns+"name": permission})
+
+          main = None
+          for activity in app.findall("activity"):
+              if activity.get(ns+"name", "").endswith("MainActivity"):
+                  main = activity
+                  break
+
+          if main is None:
+              main = ET.SubElement(app, "activity", {ns+"name": ".MainActivity"})
+
+          main.set(ns+"exported", "true")
+
+          dial_filter = ET.SubElement(main, "intent-filter")
+          ET.SubElement(dial_filter, "action", {ns+"name": "android.intent.action.DIAL"})
+          ET.SubElement(dial_filter, "category", {ns+"name": "android.intent.category.DEFAULT"})
+          ET.SubElement(dial_filter, "data", {ns+"scheme": "tel"})
+
+          if not any(x.get(ns+"name") == ".CallActivity" for x in app.findall("activity")):
+              ET.SubElement(app, "activity", {
+                  ns+"name": ".CallActivity",
+                  ns+"exported": "false"
+              })
+
+          if not any(x.get(ns+"name") == ".PhoneInCallService" for x in app.findall("service")):
+              service = ET.SubElement(app, "service", {
+                  ns+"name": ".PhoneInCallService",
+                  ns+"permission": "android.permission.BIND_INCALL_SERVICE",
+                  ns+"exported": "true"
+              })
+              intent = ET.SubElement(service, "intent-filter")
+              ET.SubElement(intent, "action", {
+                  ns+"name": "android.telecom.InCallService"
+              })
+              ET.SubElement(service, "meta-data", {
+                  ns+"name": "android.telecom.IN_CALL_SERVICE_UI",
+                  ns+"value": "true"
+              })
 
           tree.write(path, encoding="utf-8", xml_declaration=True)
           PY
 
-      - name: Create new Dialer interface
+      - name: Create Main Dialer
         run: |
           cat > app/src/main/java/com/motog85/odialer/MainActivity.kt <<'EOF'
           package com.motog85.odialer
 
           import android.Manifest
+          import android.app.role.RoleManager
           import android.content.Intent
           import android.content.pm.PackageManager
           import android.net.Uri
           import android.os.Bundle
+          import android.provider.CallLog
           import android.provider.ContactsContract
           import androidx.activity.ComponentActivity
           import androidx.activity.compose.setContent
@@ -92,35 +132,65 @@ jobs:
           import androidx.compose.ui.text.style.TextAlign
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          data class RecentCall(
+              val name: String,
+              val number: String,
+              val type: String,
+              val date: String
+          )
 
           class MainActivity : ComponentActivity() {
 
-              private val savedContacts =
-                  mutableStateListOf<Pair<String, String>>()
+              private val contacts = mutableStateListOf<Pair<String, String>>()
+              private val recentCalls = mutableStateListOf<RecentCall>()
 
-              private val contactsPermissionLauncher =
-                  registerForActivityResult(
-                      ActivityResultContracts.RequestPermission()
-                  ) { granted ->
-                      if (granted) {
-                          loadContacts()
+              private val contactsPermission =
+                  registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+                      if (it) loadContacts()
+                  }
+
+              private val callLogPermission =
+                  registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+                      if (it) loadRecent()
+                  }
+
+              private val rolePermission =
+                  registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+                      if (isDefaultDialer()) {
+                          requestCallLogPermission()
                       }
                   }
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
 
-                  if (checkSelfPermission(Manifest.permission.READ_CONTACTS)
-                      == PackageManager.PERMISSION_GRANTED) {
+                  if (checkSelfPermission(Manifest.permission.READ_CONTACTS) ==
+                      PackageManager.PERMISSION_GRANTED) {
                       loadContacts()
                   } else {
-                      contactsPermissionLauncher.launch(
-                          Manifest.permission.READ_CONTACTS
-                      )
+                      contactsPermission.launch(Manifest.permission.READ_CONTACTS)
                   }
 
                   setContent {
                       var number by remember { mutableStateOf("") }
+                      var page by remember { mutableStateOf("Dialer") }
+
+                      val green = Color(0xFF00C967)
+                      val gray = Color(0xFFF0F1F3)
+
+                      val suggestions = if (number.isBlank()) {
+                          contacts.take(15)
+                      } else {
+                          contacts.filter {
+                              it.first.contains(number, true) ||
+                                  it.second.filter { c -> c.isDigit() }
+                                      .contains(number.filter { c -> c.isDigit() })
+                          }.take(15)
+                      }
 
                       val keys = listOf(
                           listOf("1" to "", "2" to "ABC", "3" to "DEF"),
@@ -128,21 +198,6 @@ jobs:
                           listOf("7" to "PQRS", "8" to "TUV", "9" to "WXYZ"),
                           listOf("*" to "", "0" to "+", "#" to "")
                       )
-
-                      val lightGray = Color(0xFFF1F1F1)
-                      val green = Color(0xFF00C967)
-
-                      val search = number.filter { it.isDigit() }
-
-                      val suggestions = if (search.isNotEmpty()) {
-                          savedContacts.filter { contact ->
-                              val phone = contact.second.filter { it.isDigit() }
-                              phone.startsWith(search) ||
-                                  contact.first.contains(number, ignoreCase = true)
-                          }.take(5)
-                      } else {
-                          emptyList()
-                      }
 
                       MaterialTheme {
                           Surface(
@@ -152,106 +207,159 @@ jobs:
                               Column(
                                   modifier = Modifier
                                       .fillMaxSize()
-                                      .padding(horizontal = 22.dp)
+                                      .padding(horizontal = 18.dp)
                               ) {
                                   Row(
                                       modifier = Modifier
                                           .fillMaxWidth()
-                                          .padding(top = 24.dp),
-                                      horizontalArrangement =
-                                          Arrangement.SpaceBetween,
-                                      verticalAlignment =
-                                          Alignment.CenterVertically
-                                  ) {
-                                      CircleAction("‹", lightGray) {
-                                          number = ""
-                                      }
-
-                                      Row(
-                                          verticalAlignment =
-                                              Alignment.CenterVertically
-                                      ) {
-                                          CircleAction("⌕", lightGray) {
-                                              try {
-                                                  startActivity(
-                                                      Intent(
-                                                          Intent.ACTION_VIEW,
-                                                          ContactsContract.Contacts.CONTENT_URI
-                                                      )
-                                                  )
-                                              } catch (_: Exception) {}
-                                          }
-
-                                          Spacer(Modifier.width(12.dp))
-
-                                          CircleAction("▦", lightGray) {
-                                              number = ""
-                                          }
-                                      }
-                                  }
-
-                                  Box(
-                                      modifier = Modifier
-                                          .fillMaxWidth()
-                                          .weight(1f),
-                                      contentAlignment = Alignment.Center
+                                          .padding(top = 12.dp),
+                                      horizontalArrangement = Arrangement.SpaceBetween,
+                                      verticalAlignment = Alignment.CenterVertically
                                   ) {
                                       Text(
-                                          text = number,
-                                          fontSize = 30.sp,
-                                          color = Color.Black,
-                                          fontWeight = FontWeight.Medium,
-                                          textAlign = TextAlign.Center
-                                      )
-                                  }
-
-                                  if (suggestions.isNotEmpty()) {
-                                      Text(
-                                          "CONTACT SUGGESTIONS",
-                                          modifier = Modifier.padding(
-                                              start = 8.dp, bottom = 5.dp
-                                          ),
-                                          fontSize = 12.sp,
-                                          color = Color.Gray,
+                                          "ODialer",
+                                          fontSize = 24.sp,
                                           fontWeight = FontWeight.Bold
+                                      )
+
+                                      TextButton(onClick = { requestDefaultDialer() }) {
+                                          Text("Default Phone", color = green)
+                                      }
+                                  }
+
+                                  Row(
+                                      modifier = Modifier.fillMaxWidth(),
+                                      horizontalArrangement = Arrangement.SpaceEvenly
+                                  ) {
+                                      TextButton(onClick = { page = "Dialer" }) {
+                                          Text(
+                                              "Dialer",
+                                              color = if (page == "Dialer") green else Color.Gray
+                                          )
+                                      }
+
+                                      TextButton(onClick = {
+                                          page = "Recent"
+                                          requestCallLogPermission()
+                                      }) {
+                                          Text(
+                                              "Recent",
+                                              color = if (page == "Recent") green else Color.Gray
+                                          )
+                                      }
+                                  }
+
+                                  if (page == "Recent") {
+                                      Text(
+                                          "Recent Calls",
+                                          fontSize = 22.sp,
+                                          fontWeight = FontWeight.Bold,
+                                          modifier = Modifier.padding(vertical = 12.dp)
+                                      )
+
+                                      if (!isDefaultDialer()) {
+                                          Text(
+                                              "Call History देखने के लिए ODialer को Default Phone App बनाएँ।",
+                                              color = Color.Gray,
+                                              modifier = Modifier.padding(8.dp)
+                                          )
+                                          Button(
+                                              onClick = { requestDefaultDialer() },
+                                              colors = ButtonDefaults.buttonColors(
+                                                  containerColor = green
+                                              )
+                                          ) {
+                                              Text("Make Default Phone App")
+                                          }
+                                      } else if (recentCalls.isEmpty()) {
+                                          Text(
+                                              "अभी कोई Call History उपलब्ध नहीं है।",
+                                              color = Color.Gray
+                                          )
+                                      } else {
+                                          LazyColumn {
+                                              items(recentCalls) { call ->
+                                                  Row(
+                                                      modifier = Modifier
+                                                          .fillMaxWidth()
+                                                          .clickable {
+                                                              number = call.number
+                                                              page = "Dialer"
+                                                          }
+                                                          .padding(vertical = 12.dp),
+                                                      verticalAlignment = Alignment.CenterVertically
+                                                  ) {
+                                                      Text(
+                                                          when (call.type) {
+                                                              "Missed" -> "↙"
+                                                              "Incoming" -> "↙"
+                                                              else -> "↗"
+                                                          },
+                                                          color = if (call.type == "Missed") Color.Red else green,
+                                                          fontSize = 25.sp
+                                                      )
+
+                                                      Column(
+                                                          modifier = Modifier
+                                                              .weight(1f)
+                                                              .padding(start = 14.dp)
+                                                      ) {
+                                                          Text(
+                                                              call.name.ifBlank { call.number },
+                                                              fontWeight = FontWeight.Bold,
+                                                              fontSize = 17.sp
+                                                          )
+                                                          Text(
+                                                              "${call.type} • ${call.date}",
+                                                              color = Color.Gray,
+                                                              fontSize = 13.sp
+                                                          )
+                                                      }
+
+                                                      TextButton(onClick = {
+                                                          number = call.number
+                                                          page = "Dialer"
+                                                      }) {
+                                                          Text("Call", color = green)
+                                                      }
+                                                  }
+                                                  HorizontalDivider()
+                                              }
+                                          }
+                                      }
+                                  } else {
+                                      Text(
+                                          "CONTACTS",
+                                          color = Color.Gray,
+                                          fontWeight = FontWeight.Bold,
+                                          fontSize = 12.sp,
+                                          modifier = Modifier.padding(top = 8.dp, bottom = 5.dp)
                                       )
 
                                       LazyColumn(
                                           modifier = Modifier
                                               .fillMaxWidth()
-                                              .heightIn(max = 125.dp)
+                                              .weight(1f)
                                       ) {
                                           items(suggestions) { contact ->
                                               Row(
                                                   modifier = Modifier
                                                       .fillMaxWidth()
-                                                      .clickable {
-                                                          number = contact.second
-                                                      }
-                                                      .padding(
-                                                          horizontal = 8.dp,
-                                                          vertical = 7.dp
-                                                      ),
-                                                  verticalAlignment =
-                                                      Alignment.CenterVertically
+                                                      .clickable { number = contact.second }
+                                                      .padding(vertical = 8.dp),
+                                                  verticalAlignment = Alignment.CenterVertically
                                               ) {
                                                   Box(
                                                       modifier = Modifier
-                                                          .size(38.dp)
+                                                          .size(42.dp)
                                                           .clip(CircleShape)
-                                                          .background(
-                                                              Color(0xFFE8EEF8)
-                                                          ),
-                                                      contentAlignment =
-                                                          Alignment.Center
+                                                          .background(Color(0xFFE8EEF8)),
+                                                      contentAlignment = Alignment.Center
                                                   ) {
                                                       Text(
-                                                          contact.first
-                                                              .take(1)
-                                                              .uppercase(),
+                                                          contact.first.take(1).uppercase(),
                                                           color = Color(0xFF315A91),
-                                                          fontWeight =
-                                                              FontWeight.Bold
+                                                          fontWeight = FontWeight.Bold
                                                       )
                                                   }
 
@@ -262,9 +370,7 @@ jobs:
                                                   ) {
                                                       Text(
                                                           contact.first,
-                                                          color = Color.Black,
-                                                          fontWeight =
-                                                              FontWeight.SemiBold
+                                                          fontWeight = FontWeight.SemiBold
                                                       )
                                                       Text(
                                                           contact.second,
@@ -272,133 +378,96 @@ jobs:
                                                           fontSize = 13.sp
                                                       )
                                                   }
-
-                                                  Text(
-                                                      "›",
-                                                      fontSize = 25.sp,
-                                                      color = Color.Gray
-                                                  )
                                               }
                                           }
                                       }
-                                  }
 
-                                  Column(
-                                      modifier = Modifier.fillMaxWidth(),
-                                      horizontalAlignment =
-                                          Alignment.CenterHorizontally
-                                  ) {
+                                      Text(
+                                          number,
+                                          modifier = Modifier
+                                              .fillMaxWidth()
+                                              .padding(vertical = 8.dp),
+                                          fontSize = 36.sp,
+                                          textAlign = TextAlign.Center,
+                                          fontWeight = FontWeight.Bold
+                                      )
+
                                       keys.forEach { row ->
                                           Row(
                                               modifier = Modifier
                                                   .fillMaxWidth()
-                                                  .padding(vertical = 8.dp),
-                                              horizontalArrangement =
-                                                  Arrangement.SpaceEvenly
+                                                  .padding(vertical = 3.dp),
+                                              horizontalArrangement = Arrangement.SpaceEvenly
                                           ) {
-                                              row.forEach { item ->
+                                              row.forEach { key ->
                                                   Column(
                                                       modifier = Modifier
-                                                          .size(92.dp)
+                                                          .size(72.dp)
                                                           .clip(CircleShape)
-                                                          .background(lightGray)
-                                                          .clickable {
-                                                              number += item.first
-                                                          },
-                                                      horizontalAlignment =
-                                                          Alignment.CenterHorizontally,
-                                                      verticalArrangement =
-                                                          Arrangement.Center
+                                                          .background(gray)
+                                                          .clickable { number += key.first },
+                                                      horizontalAlignment = Alignment.CenterHorizontally,
+                                                      verticalArrangement = Arrangement.Center
                                                   ) {
-                                                      Text(
-                                                          item.first,
-                                                          fontSize = 38.sp,
-                                                          color = Color.Black,
-                                                          fontWeight =
-                                                              FontWeight.Medium
-                                                      )
-
-                                                      if (item.second.isNotEmpty()) {
+                                                      Text(key.first, fontSize = 30.sp)
+                                                      if (key.second.isNotEmpty()) {
                                                           Text(
-                                                              item.second,
-                                                              fontSize = 15.sp,
-                                                              color = Color.DarkGray,
-                                                              fontWeight =
-                                                                  FontWeight.Bold
+                                                              key.second,
+                                                              fontSize = 11.sp,
+                                                              fontWeight = FontWeight.Bold
                                                           )
                                                       }
                                                   }
                                               }
                                           }
                                       }
-                                  }
 
-                                  Row(
-                                      modifier = Modifier
-                                          .fillMaxWidth()
-                                          .padding(
-                                              top = 12.dp,
-                                              bottom = 30.dp
-                                          ),
-                                      horizontalArrangement =
-                                          Arrangement.SpaceEvenly,
-                                      verticalAlignment =
-                                          Alignment.CenterVertically
-                                  ) {
-                                      BottomAction("WhatsApp") {
-                                          if (number.isNotBlank()) {
-                                              try {
-                                                  startActivity(
-                                                      Intent(
-                                                          Intent.ACTION_VIEW,
-                                                          Uri.parse(
-                                                              "https://wa.me/${number.filter { it.isDigit() }}"
-                                                          )
-                                                      )
-                                                  )
-                                              } catch (_: Exception) {}
-                                          }
-                                      }
-
-                                      Box(
+                                      Row(
                                           modifier = Modifier
-                                              .size(112.dp)
-                                              .clip(CircleShape)
-                                              .background(green)
-                                              .clickable {
-                                                  if (number.isNotBlank()) {
+                                              .fillMaxWidth()
+                                              .padding(vertical = 8.dp),
+                                          horizontalArrangement = Arrangement.SpaceEvenly,
+                                          verticalAlignment = Alignment.CenterVertically
+                                      ) {
+                                          TextButton(onClick = {
+                                              if (number.isNotBlank()) {
+                                                  try {
                                                       startActivity(
                                                           Intent(
-                                                              Intent.ACTION_DIAL,
-                                                              Uri.parse("tel:$number")
+                                                              Intent.ACTION_VIEW,
+                                                              Uri.parse("https://wa.me/${number.filter { it.isDigit() }}")
                                                           )
                                                       )
-                                                  }
-                                              },
-                                          contentAlignment =
-                                              Alignment.Center
-                                      ) {
-                                          Column(
-                                              horizontalAlignment =
-                                                  Alignment.CenterHorizontally
-                                          ) {
-                                              Text(
-                                                  "\u260E\uFE0E",
-                                                  color = Color.White,
-                                                  fontSize = 42.sp
-                                              )
-                                              Text(
-                                                  "SIM 1",
-                                                  color = Color.White,
-                                                  fontSize = 12.sp,
-                                                  fontWeight = FontWeight.Bold
-                                              )
+                                                  } catch (_: Exception) {}
+                                              }
+                                          }) {
+                                              Text("WhatsApp", color = Color.Black)
                                           }
-                                      }
 
-                                      BottomAction("⌫") {
-                                          if (number.isNotEmpty()) {
-                                              number = number.dropLast(1)
+                                          Box(
+                                              modifier = Modifier
+                                                  .size(82.dp)
+                                                  .clip(CircleShape)
+                                                  .background(green)
+                                                  .clickable {
+                                                      if (number.isNotBlank()) {
+                                                          startActivity(
+                                                              Intent(
+                                                                  Intent.ACTION_DIAL,
+                                                                  Uri.parse("tel:$number")
+                                                              )
+                                                          )
+                                                      }
+                                                  },
+                                              contentAlignment = Alignment.Center
+                                          ) {
+                                              Text("☎", fontSize = 38.sp, color = Color.White)
+                                          }
+
+                                          TextButton(onClick = {
+                                              if (number.isNotEmpty()) number = number.dropLast(1)
+                                          }) {
+                                              Text("⌫", fontSize = 28.sp, color = Color.Black)
                                           }
                                       }
                                   }
@@ -408,11 +477,46 @@ jobs:
                   }
               }
 
-              private fun loadContacts() {
-                  savedContacts.clear()
+              override fun onResume() {
+                  super.onResume()
+                  if (isDefaultDialer()) loadRecent()
+              }
 
+              private fun isDefaultDialer(): Boolean {
+                  val manager = getSystemService(RoleManager::class.java)
+                  return manager != null &&
+                      manager.isRoleAvailable(RoleManager.ROLE_DIALER) &&
+                      manager.isRoleHeld(RoleManager.ROLE_DIALER)
+              }
+
+              private fun requestDefaultDialer() {
+                  val manager = getSystemService(RoleManager::class.java)
+                  if (manager != null &&
+                      manager.isRoleAvailable(RoleManager.ROLE_DIALER) &&
+                      !manager.isRoleHeld(RoleManager.ROLE_DIALER)) {
+                      rolePermission.launch(
+                          manager.createRequestRoleIntent(RoleManager.ROLE_DIALER)
+                      )
+                  } else {
+                      requestCallLogPermission()
+                  }
+              }
+
+              private fun requestCallLogPermission() {
+                  if (!isDefaultDialer()) return
+
+                  if (checkSelfPermission(Manifest.permission.READ_CALL_LOG) ==
+                      PackageManager.PERMISSION_GRANTED) {
+                      loadRecent()
+                  } else {
+                      callLogPermission.launch(Manifest.permission.READ_CALL_LOG)
+                  }
+              }
+
+              private fun loadContacts() {
+                  contacts.clear()
                   try {
-                      val cursor = contentResolver.query(
+                      contentResolver.query(
                           ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
                           arrayOf(
                               ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
@@ -420,72 +524,179 @@ jobs:
                           ),
                           null,
                           null,
-                          ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME +
-                              " ASC"
-                      )
-
-                      cursor?.use {
-                          val nameIndex = it.getColumnIndex(
-                              ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME
-                          )
-                          val numberIndex = it.getColumnIndex(
-                              ContactsContract.CommonDataKinds.Phone.NUMBER
-                          )
-
-                          while (it.moveToNext()) {
-                              val name = it.getString(nameIndex) ?: ""
-                              val phone = it.getString(numberIndex) ?: ""
-
+                          ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " ASC"
+                      )?.use { cursor ->
+                          while (cursor.moveToNext()) {
+                              val name = cursor.getString(0) ?: ""
+                              val phone = cursor.getString(1) ?: ""
                               if (name.isNotBlank() && phone.isNotBlank()) {
-                                  savedContacts.add(name to phone)
+                                  contacts.add(name to phone)
                               }
                           }
                       }
                   } catch (_: Exception) {}
               }
-          }
 
-          @Composable
-          fun CircleAction(
-              symbol: String,
-              color: Color,
-              onClick: () -> Unit
-          ) {
-              Box(
-                  modifier = Modifier
-                      .size(56.dp)
-                      .clip(CircleShape)
-                      .background(color)
-                      .clickable { onClick() },
-                  contentAlignment = Alignment.Center
-              ) {
-                  Text(
-                      symbol,
-                      fontSize = 30.sp,
-                      color = Color.DarkGray
-                  )
+              private fun loadRecent() {
+                  recentCalls.clear()
+
+                  if (!isDefaultDialer()) return
+
+                  if (checkSelfPermission(Manifest.permission.READ_CALL_LOG) !=
+                      PackageManager.PERMISSION_GRANTED) return
+
+                  try {
+                      contentResolver.query(
+                          CallLog.Calls.CONTENT_URI,
+                          arrayOf(
+                              CallLog.Calls.CACHED_NAME,
+                              CallLog.Calls.NUMBER,
+                              CallLog.Calls.TYPE,
+                              CallLog.Calls.DATE
+                          ),
+                          null,
+                          null,
+                          CallLog.Calls.DATE + " DESC"
+                      )?.use { cursor ->
+                          while (cursor.moveToNext()) {
+                              val name = cursor.getString(0) ?: ""
+                              val number = cursor.getString(1) ?: ""
+                              val code = cursor.getInt(2)
+                              val timestamp = cursor.getLong(3)
+
+                              val type = when (code) {
+                                  CallLog.Calls.INCOMING_TYPE -> "Incoming"
+                                  CallLog.Calls.OUTGOING_TYPE -> "Outgoing"
+                                  CallLog.Calls.MISSED_TYPE -> "Missed"
+                                  CallLog.Calls.REJECTED_TYPE -> "Rejected"
+                                  else -> "Other"
+                              }
+
+                              val date = SimpleDateFormat(
+                                  "dd MMM, hh:mm a",
+                                  Locale.getDefault()
+                              ).format(Date(timestamp))
+
+                              recentCalls.add(RecentCall(name, number, type, date))
+                          }
+                      }
+                  } catch (_: Exception) {}
               }
           }
+          EOF
 
-          @Composable
-          fun BottomAction(
-              label: String,
-              onClick: () -> Unit
-          ) {
-              Box(
-                  modifier = Modifier
-                      .size(64.dp)
-                      .clip(CircleShape)
-                      .clickable { onClick() },
-                  contentAlignment = Alignment.Center
-              ) {
-                  Text(
-                      label,
-                      fontSize = if (label == "⌫") 32.sp else 13.sp,
-                      color = Color.Black,
-                      fontWeight = FontWeight.Bold,
-                      textAlign = TextAlign.Center
-                  )
+      - name: Create InCallService
+        run: |
+          cat > app/src/main/java/com/motog85/odialer/PhoneInCallService.kt <<'EOF'
+          package com.motog85.odialer
+
+          import android.content.Intent
+          import android.telecom.Call
+          import android.telecom.InCallService
+
+          class PhoneInCallService : InCallService() {
+
+              override fun onCallAdded(call: Call) {
+                  super.onCallAdded(call)
+                  CallActivity.currentCall = call
+
+                  try {
+                      val intent = Intent(this, CallActivity::class.java)
+                      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      startActivity(intent)
+                  } catch (_: Exception) {}
+              }
+
+              override fun onCallRemoved(call: Call) {
+                  super.onCallRemoved(call)
+                  if (CallActivity.currentCall == call) {
+                      CallActivity.currentCall = null
+                  }
+              }
+          }
+          EOF
+
+      - name: Create Call Screen
+        run: |
+          cat > app/src/main/java/com/motog85/odialer/CallActivity.kt <<'EOF'
+          package com.motog85.odialer
+
+          import android.os.Bundle
+          import android.telecom.Call
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.material3.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+
+          class CallActivity : ComponentActivity() {
+
+              companion object {
+                  var currentCall: Call? = null
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  setContent {
+                      val call = currentCall
+                      val number = call?.details?.handle?.schemeSpecificPart ?: "Unknown"
+
+                      MaterialTheme {
+                          Column(
+                              modifier = Modifier
+                                  .fillMaxSize()
+                                  .background(Color(0xFF101B35))
+                                  .padding(24.dp),
+                              horizontalAlignment = Alignment.CenterHorizontally,
+                              verticalArrangement = Arrangement.Center
+                          ) {
+                              Text("ODialer", color = Color.White, fontSize = 22.sp)
+                              Spacer(Modifier.height(40.dp))
+                              Text(number, color = Color.White, fontSize = 28.sp)
+                              Spacer(Modifier.height(18.dp))
+                              Text(
+                                  when (call?.state) {
+                                      Call.STATE_RINGING -> "Incoming call"
+                                      Call.STATE_ACTIVE -> "Connected"
+                                      Call.STATE_DIALING -> "Calling..."
+                                      else -> "Call"
+                                  },
+                                  color = Color.LightGray
+                              )
+                              Spacer(Modifier.height(60.dp))
+
+                              if (call?.state == Call.STATE_RINGING) {
+                                  Button(
+                                      onClick = { call.answer(0) },
+                                      colors = ButtonDefaults.buttonColors(
+                                          containerColor = Color(0xFF00C967)
+                                      )
+                                  ) {
+                                      Text("Answer")
+                                  }
+                                  Spacer(Modifier.height(18.dp))
+                              }
+
+                              Button(
+                                  onClick = {
+                                      call?.disconnect()
+                                      finish()
+                                  },
+                                  colors = ButtonDefaults.buttonColors(
+                                      containerColor = Color.Red
+                                  )
+                              ) {
+                                  Text("End Call")
+                              }
+                          }
+                      }
+                  }
               }
           }
           EOF
@@ -511,5 +722,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ODialer-MotoG85-APK
+          name: ODialer-MotoG85-v2
           path: app/build/outputs/apk/debug/app-debug.apk
