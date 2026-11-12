@@ -1,4 +1,3 @@
-
 name: Build ODialer Moto G85
 
 on:
@@ -40,6 +39,21 @@ jobs:
           unzip -q ODialer-MotoG85-starter.zip -d /tmp/odialer-src
           cp -a /tmp/odialer-src/ODialer-MotoG85/. .
 
+      - name: Set Java and Kotlin target to 17
+        run: |
+          cat >> app/build.gradle.kts <<'EOF'
+
+          android {
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          EOF
+
       - name: Build Debug APK
         run: gradle assembleDebug
 
@@ -48,4 +62,3 @@ jobs:
         with:
           name: ODialer-MotoG85-APK
           path: app/build/outputs/apk/debug/app-debug.apk
-          
