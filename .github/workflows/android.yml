@@ -75,6 +75,7 @@ jobs:
           import android.provider.ContactsContract
           import androidx.activity.ComponentActivity
           import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
           import androidx.compose.foundation.background
           import androidx.compose.foundation.clickable
           import androidx.compose.foundation.layout.*
@@ -97,6 +98,15 @@ jobs:
               private val savedContacts =
                   mutableStateListOf<Pair<String, String>>()
 
+              private val contactsPermissionLauncher =
+                  registerForActivityResult(
+                      ActivityResultContracts.RequestPermission()
+                  ) { granted ->
+                      if (granted) {
+                          loadContacts()
+                      }
+                  }
+
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
 
@@ -104,8 +114,8 @@ jobs:
                       == PackageManager.PERMISSION_GRANTED) {
                       loadContacts()
                   } else {
-                      requestPermissions(
-                          arrayOf(Manifest.permission.READ_CONTACTS), 101
+                      contactsPermissionLauncher.launch(
+                          Manifest.permission.READ_CONTACTS
                       )
                   }
 
@@ -262,6 +272,7 @@ jobs:
                                                           fontSize = 13.sp
                                                       )
                                                   }
+
                                                   Text(
                                                       "›",
                                                       fontSize = 25.sp,
@@ -431,23 +442,6 @@ jobs:
                           }
                       }
                   } catch (_: Exception) {}
-              }
-
-              override fun onRequestPermissionsResult(
-                  requestCode: Int,
-                  permissions: Array<out String>,
-                  grantResults: IntArray
-              ) {
-                  super.onRequestPermissionsResult(
-                      requestCode, permissions, grantResults
-                  )
-
-                  if (requestCode == 101 &&
-                      grantResults.isNotEmpty() &&
-                      grantResults[0] == PackageManager.PERMISSION_GRANTED
-                  ) {
-                      loadContacts()
-                  }
               }
           }
 
