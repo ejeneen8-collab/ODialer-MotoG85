@@ -23,10 +23,21 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
+      - name: Install Android SDK components
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.11.1
+
+      - name: Extract Android project
+        run: |
+          mkdir -p /tmp/odialer-src
+          unzip -q ODialer-MotoG85-starter.zip -d /tmp/odialer-src
+          cp -a /tmp/odialer-src/ODialer-MotoG85/. .
 
       - name: Build Debug APK
         run: gradle assembleDebug
