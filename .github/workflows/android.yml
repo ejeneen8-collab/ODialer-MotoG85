@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: odialer-motog85-build
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -43,12 +47,54 @@ jobs:
           unzip -q ODialer-MotoG85-starter.zip -d /tmp/odialer-src
           cp -a /tmp/odialer-src/ODialer-MotoG85/. .
 
+      - name: Fix Java and Kotlin JVM target 17
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("app/build.gradle.kts")
+
+          if not path.exists():
+              raise SystemExit("ERROR: app/build.gradle.kts not found")
+
+          content = path.read_text()
+
+          fix = """
+
+          // ODialer build compatibility fix: use JVM 17 for Java and Kotlin.
+          android {
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+          }
+
+          tasks.withType<JavaCompile>().configureEach {
+              sourceCompatibility = "17"
+              targetCompatibility = "17"
+          }
+
+          tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          """
+
+          if "ODialer build compatibility fix: use JVM 17" not in content:
+              content += fix
+
+          path.write_text(content)
+          print("SUCCESS: Java and Kotlin JVM targets configured to 17")
+          PY
+
       - name: Install app icon resources
         run: |
           if [ -f ODialer-permanent-icon-resources.zip ]; then
             mkdir -p /tmp/odialer-icon
             unzip -q ODialer-permanent-icon-resources.zip -d /tmp/odialer-icon
             if [ -d /tmp/odialer-icon/app/src/main/res ]; then
+              mkdir -p app/src/main/res
               cp -a /tmp/odialer-icon/app/src/main/res/. app/src/main/res/
             fi
           fi
@@ -1054,4 +1100,3 @@ jobs:
         with:
           name: ODialer-MotoG85-v4
           path: app/build/outputs/apk/debug/app-debug.apk
-
