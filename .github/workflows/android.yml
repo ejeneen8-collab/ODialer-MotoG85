@@ -127,7 +127,10 @@ jobs:
               "android.permission.READ_CONTACTS",
               "android.permission.READ_CALL_LOG",
               "android.permission.CALL_PHONE",
-              "android.permission.READ_PHONE_STATE"
+              "android.permission.READ_PHONE_STATE",
+              "android.permission.ANSWER_PHONE_CALLS",
+              "android.permission.MODIFY_AUDIO_SETTINGS",
+              "android.permission.READ_PHONE_NUMBERS"
           ]
 
           for permission in permissions:
@@ -240,6 +243,10 @@ jobs:
                       ns + "exported": "false"
                   }
               )
+          call_activity.set(ns + "exported", "false")
+          call_activity.set(ns + "launchMode", "singleTop")
+          call_activity.set(ns + "showWhenLocked", "true")
+          call_activity.set(ns + "turnScreenOn", "true")
 
           service = None
           for item in app.findall("service"):
@@ -1171,130 +1178,443 @@ jobs:
           print("Theme settings created and connected to MainActivity")
           PY
 
-      - name: Create In-call service
+      - name: Create In-call service and call controller
         run: |
           cat > app/src/main/java/com/motog85/odialer/PhoneInCallService.kt <<'EOF'
           package com.motog85.odialer
 
           import android.content.Intent
           import android.telecom.Call
+          import android.telecom.CallAudioState
           import android.telecom.InCallService
+          import android.os.Handler
+          import android.os.Looper
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+
+          object CallStore {
+              var currentCall by mutableStateOf<Call?>(null)
+              var service: PhoneInCallService? = null
+              var audioRoute by mutableStateOf(CallAudioState.ROUTE_EARPIECE)
+              var supportedRoutes by mutableStateOf(CallAudioState.ROUTE_EARPIECE)
+              var muted by mutableStateOf(false)
+              var revision by mutableStateOf(0)
+              private val mainHandler = Handler(Looper.getMainLooper())
+
+              val callback = object : Call.Callback() {
+                  override fun onStateChanged(call: Call, state: Int) {
+                      mainHandler.post { revision++ }
+                  }
+                  override fun onDetailsChanged(call: Call, details: Call.Details) {
+                      mainHandler.post { revision++ }
+                  }
+                  override fun onParentChanged(call: Call, parent: Call?) {
+                      mainHandler.post { revision++ }
+                  }
+              }
+
+              fun attach(call: Call) {
+                  currentCall?.unregisterCallback(callback)
+                  currentCall = call
+                  call.registerCallback(callback, mainHandler)
+                  revision++
+              }
+
+              fun detach(call: Call) {
+                  call.unregisterCallback(callback)
+                  if (currentCall === call) currentCall = null
+                  revision++
+              }
+
+              fun setRoute(route: Int) {
+                  service?.setAudioRoute(route)
+              }
+
+              fun toggleMute() {
+                  muted = !muted
+                  service?.setMuted(muted)
+              }
+          }
 
           class PhoneInCallService : InCallService() {
+              override fun onCreate() {
+                  super.onCreate()
+                  CallStore.service = this
+              }
 
               override fun onCallAdded(call: Call) {
                   super.onCallAdded(call)
-
-                  CallActivity.currentCall = call
-
-                  val intent = Intent(this, CallActivity::class.java)
-                  intent.addFlags(
-                      Intent.FLAG_ACTIVITY_NEW_TASK or
-                      Intent.FLAG_ACTIVITY_SINGLE_TOP
-                  )
+                  CallStore.attach(call)
+                  val intent = Intent(this, CallActivity::class.java).apply {
+                      addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                  }
                   startActivity(intent)
               }
 
               override fun onCallRemoved(call: Call) {
+                  CallStore.detach(call)
                   super.onCallRemoved(call)
+              }
 
-                  if (CallActivity.currentCall == call) {
-                      CallActivity.currentCall = null
-                  }
+              override fun onCallAudioStateChanged(audioState: CallAudioState) {
+                  super.onCallAudioStateChanged(audioState)
+                  CallStore.audioRoute = audioState.route
+                  CallStore.supportedRoutes = audioState.supportedRouteMask
+                  CallStore.muted = audioState.isMuted
+              }
+
+              override fun onDestroy() {
+                  if (CallStore.service === this) CallStore.service = null
+                  super.onDestroy()
               }
           }
           EOF
 
-      - name: Create Call screen
+      - name: Create full in-call screen
         run: |
           cat > app/src/main/java/com/motog85/odialer/CallActivity.kt <<'EOF'
           package com.motog85.odialer
 
+          import android.content.Intent
+          import android.net.Uri
           import android.os.Bundle
+          import android.os.SystemClock
+          import android.provider.ContactsContract
           import android.telecom.Call
+          import android.telecom.CallAudioState
+          import android.telecom.TelecomManager
+          import android.view.WindowManager
           import androidx.activity.ComponentActivity
           import androidx.activity.compose.setContent
           import androidx.compose.foundation.background
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.material3.*
+          import androidx.compose.runtime.*
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
           import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.delay
+          import java.util.Locale
 
           class CallActivity : ComponentActivity() {
-
-              companion object {
-                  var currentCall: Call? = null
-              }
-
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+                  window.addFlags(
+                      WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                      WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+                      WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                  )
+                  showCallScreen()
+              }
 
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  setIntent(intent)
+                  showCallScreen()
+              }
+
+              private fun showCallScreen() {
                   setContent {
-                      val call = currentCall
+                      val call = CallStore.currentCall
+                      val revision = CallStore.revision
+                      val route = CallStore.audioRoute
+                      val routes = CallStore.supportedRoutes
+                      val muted = CallStore.muted
+                      var keypadVisible by remember { mutableStateOf(false) }
+                      var recordMessage by remember { mutableStateOf(false) }
+                      var elapsed by remember { mutableLongStateOf(0L) }
+                      val number = call?.details?.handle?.schemeSpecificPart.orEmpty()
+                      val contactName = remember(number) { lookupContactName(number) }
                       val incoming = call?.state == Call.STATE_RINGING
+                      val active = call?.state == Call.STATE_ACTIVE
+                      val holding = call?.state == Call.STATE_HOLDING
+                      val connectTime = call?.details?.connectTimeMillis ?: 0L
 
-                      Column(
-                          modifier = Modifier
-                              .fillMaxSize()
-                              .background(Color(0xFF101C2C))
-                              .padding(24.dp),
-                          horizontalAlignment = Alignment.CenterHorizontally,
-                          verticalArrangement = Arrangement.SpaceEvenly
-                      ) {
-                          Text(
-                              if (incoming) "Incoming call" else "Call",
-                              color = Color.White,
-                              fontSize = 24.sp
-                          )
+                      LaunchedEffect(call, active, connectTime, revision) {
+                          while (call != null && active) {
+                              elapsed = if (connectTime > 0L)
+                                  ((System.currentTimeMillis() - connectTime) / 1000L).coerceAtLeast(0L)
+                              else 0L
+                              delay(1000)
+                          }
+                      }
 
-                          Text(
-                              call?.details?.handle?.schemeSpecificPart ?: "Unknown",
-                              color = Color.White,
-                              fontSize = 22.sp
-                          )
-
-                          Row(
-                              horizontalArrangement = Arrangement.spacedBy(25.dp)
+                      MaterialTheme {
+                          Surface(
+                              modifier = Modifier.fillMaxSize(),
+                              color = Color(0xFF101D31)
                           ) {
-                              if (incoming) {
-                                  Button(
-                                      onClick = { call?.answer(0) },
-                                      colors = ButtonDefaults.buttonColors(
-                                          containerColor = Color(0xFF00C967)
-                                      ),
-                                      shape = CircleShape
-                                  ) {
-                                      Text("Answer")
+                              Column(
+                                  modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 30.dp),
+                                  horizontalAlignment = Alignment.CenterHorizontally,
+                                  verticalArrangement = Arrangement.SpaceBetween
+                              ) {
+                                  Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                      Text("ODialer", color = Color.White, fontSize = 27.sp,
+                                          fontWeight = FontWeight.Bold)
+                                      Spacer(Modifier.height(30.dp))
+                                      Box(
+                                          modifier = Modifier.size(104.dp).background(
+                                              Color(0xFF263B59), CircleShape
+                                          ),
+                                          contentAlignment = Alignment.Center
+                                      ) {
+                                          Text(
+                                              (contactName.ifBlank { number.ifBlank { "?" } })
+                                                  .take(1).uppercase(Locale.getDefault()),
+                                              color = Color.White, fontSize = 42.sp,
+                                              fontWeight = FontWeight.Bold
+                                          )
+                                      }
+                                      Spacer(Modifier.height(18.dp))
+                                      Text(contactName.ifBlank { "Unknown caller" },
+                                          color = Color.White, fontSize = 25.sp,
+                                          fontWeight = FontWeight.SemiBold,
+                                          textAlign = TextAlign.Center)
+                                      Text(number, color = Color(0xFFB9C7D9), fontSize = 17.sp)
+                                      Spacer(Modifier.height(10.dp))
+                                      Text(
+                                          when {
+                                              incoming -> "Incoming call"
+                                              call?.state == Call.STATE_DIALING -> "Calling…"
+                                              call?.state == Call.STATE_CONNECTING -> "Connecting…"
+                                              active -> "Connected  •  ${formatDuration(elapsed)}"
+                                              holding -> "On hold"
+                                              call == null -> "Call ended"
+                                              else -> "Call"
+                                          },
+                                          color = Color(0xFFB9C7D9), fontSize = 15.sp
+                                      )
+                                      val account = call?.details?.accountHandle?.id.orEmpty()
+                                      if (account.isNotBlank()) {
+                                          Text("SIM: $account", color = Color(0xFF91A4BD), fontSize = 12.sp)
+                                      }
                                   }
 
-                                  Button(
-                                      onClick = { call?.disconnect() },
-                                      colors = ButtonDefaults.buttonColors(
-                                          containerColor = Color.Red
-                                      ),
-                                      shape = CircleShape
-                                  ) {
-                                      Text("Decline")
-                                  }
-                              } else {
-                                  Button(
-                                      onClick = { call?.disconnect() },
-                                      colors = ButtonDefaults.buttonColors(
-                                          containerColor = Color.Red
-                                      ),
-                                      shape = CircleShape
-                                  ) {
-                                      Text("End call")
+                                  if (incoming) {
+                                      Row(
+                                          modifier = Modifier.fillMaxWidth(),
+                                          horizontalArrangement = Arrangement.SpaceEvenly,
+                                          verticalAlignment = Alignment.CenterVertically
+                                      ) {
+                                          BigCallButton("Decline", Color(0xFFE53935)) {
+                                              call?.reject(false, null)
+                                          }
+                                          BigCallButton("Answer", Color(0xFF00C878)) {
+                                              call?.answer(android.telecom.VideoProfile.STATE_AUDIO_ONLY)
+                                          }
+                                      }
+                                  } else {
+                                      Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                          if (keypadVisible) {
+                                              val digits = listOf(
+                                                  listOf("1", "2", "3"),
+                                                  listOf("4", "5", "6"),
+                                                  listOf("7", "8", "9"),
+                                                  listOf("*", "0", "#")
+                                              )
+                                              digits.forEach { row ->
+                                                  Row(horizontalArrangement = Arrangement.spacedBy(22.dp)) {
+                                                      row.forEach { digit ->
+                                                          Button(
+                                                              onClick = {
+                                                                  val c = digit.first()
+                                                                  call?.playDtmfTone(c)
+                                                                  android.os.Handler(mainLooper).postDelayed(
+                                                                      { call?.stopDtmfTone() }, 150
+                                                                  )
+                                                              },
+                                                              modifier = Modifier.size(66.dp),
+                                                              shape = CircleShape,
+                                                              colors = ButtonDefaults.buttonColors(
+                                                                  containerColor = Color(0xFF263B59)
+                                                              )
+                                                          ) { Text(digit, fontSize = 22.sp, color = Color.White) }
+                                                      }
+                                                  }
+                                                  Spacer(Modifier.height(8.dp))
+                                              }
+                                          } else {
+                                              val speakerOn = route == CallAudioState.ROUTE_SPEAKER
+                                              val bluetoothOn = route == CallAudioState.ROUTE_BLUETOOTH
+                                              Row(
+                                                  modifier = Modifier.fillMaxWidth(),
+                                                  horizontalArrangement = Arrangement.SpaceEvenly
+                                              ) {
+                                                  ControlButton("Mute", muted, routes != 0) {
+                                                      CallStore.toggleMute()
+                                                  }
+                                                  ControlButton("Keypad", false, true) {
+                                                      keypadVisible = true
+                                                  }
+                                                  ControlButton("Speaker", speakerOn, true) {
+                                                      CallStore.setRoute(
+                                                          if (speakerOn) CallAudioState.ROUTE_EARPIECE
+                                                          else CallAudioState.ROUTE_SPEAKER
+                                                      )
+                                                  }
+                                              }
+                                              Spacer(Modifier.height(20.dp))
+                                              Row(
+                                                  modifier = Modifier.fillMaxWidth(),
+                                                  horizontalArrangement = Arrangement.SpaceEvenly
+                                              ) {
+                                                  ControlButton("Bluetooth", bluetoothOn,
+                                                      (routes and CallAudioState.ROUTE_BLUETOOTH) != 0) {
+                                                      CallStore.setRoute(
+                                                          if (bluetoothOn) CallAudioState.ROUTE_EARPIECE
+                                                          else CallAudioState.ROUTE_BLUETOOTH
+                                                      )
+                                                  }
+                                                  val canHold = call?.details?.let {
+                                                      (it.callCapabilities and Call.Details.CAPABILITY_SUPPORT_HOLD) != 0
+                                                  } == true
+                                                  ControlButton(
+                                                      if (holding) "Resume" else "Hold",
+                                                      holding, canHold
+                                                  ) {
+                                                      if (holding) call?.unhold() else call?.hold()
+                                                  }
+                                                  ControlButton("Add call", false, true) {
+                                                      try {
+                                                          startActivity(Intent(Intent.ACTION_DIAL))
+                                                      } catch (_: Exception) {
+                                                          startActivity(Intent(Intent.ACTION_DIAL))
+                                                      }
+                                                  }
+                                              }
+                                              Spacer(Modifier.height(18.dp))
+                                              Row(
+                                                  modifier = Modifier.fillMaxWidth(),
+                                                  horizontalArrangement = Arrangement.SpaceEvenly
+                                              ) {
+                                                  ControlButton("Record", false, true) {
+                                                      recordMessage = true
+                                                  }
+                                                  val canMerge = call?.details?.let {
+                                                      (it.callCapabilities and Call.Details.CAPABILITY_MERGE_CONFERENCE) != 0
+                                                  } == true
+                                                  ControlButton("Merge", false, canMerge) {
+                                                      try { call?.conference(call?.conferenceableCalls?.firstOrNull()) }
+                                                      catch (_: Exception) { }
+                                                  }
+                                              }
+                                          }
+
+                                          if (keypadVisible) {
+                                              Spacer(Modifier.height(12.dp))
+                                              TextButton(onClick = { keypadVisible = false }) {
+                                                  Text("Hide keypad", color = Color.White)
+                                              }
+                                          }
+
+                                          Spacer(Modifier.height(22.dp))
+                                          Button(
+                                              onClick = { call?.disconnect() },
+                                              modifier = Modifier.width(170.dp).height(58.dp),
+                                              shape = RoundedCornerShape(30.dp),
+                                              colors = ButtonDefaults.buttonColors(
+                                                  containerColor = Color(0xFFE60000)
+                                              )
+                                          ) {
+                                              Text("End call", color = Color.White,
+                                                  fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                                          }
+                                      }
                                   }
                               }
                           }
                       }
+
+                      if (recordMessage) {
+                          AlertDialog(
+                              onDismissRequest = { recordMessage = false },
+                              title = { Text("Call recording") },
+                              text = {
+                                  Text("इस डिवाइस पर Android/Motorola की अनुमति और क्षेत्रीय नियमों के बिना दो-तरफ़ा मोबाइल कॉल रिकॉर्डिंग उपलब्ध नहीं कराई जा सकती। यह बटन रिकॉर्डिंग शुरू नहीं करता।")
+                              },
+                              confirmButton = {
+                                  TextButton(onClick = { recordMessage = false }) { Text("ठीक है") }
+                              }
+                          )
+                      }
                   }
               }
+
+              private fun lookupContactName(phone: String): String {
+                  if (phone.isBlank()) return ""
+                  return try {
+                      val uri = Uri.withAppendedPath(
+                          ContactsContract.PhoneLookup.CONTENT_FILTER_URI,
+                          Uri.encode(phone)
+                      )
+                      contentResolver.query(
+                          uri,
+                          arrayOf(ContactsContract.PhoneLookup.DISPLAY_NAME),
+                          null, null, null
+                      )?.use { cursor ->
+                          if (cursor.moveToFirst()) cursor.getString(0).orEmpty() else ""
+                      }.orEmpty()
+                  } catch (_: Exception) { "" }
+              }
+          }
+
+          @Composable
+          private fun BigCallButton(label: String, color: Color, onClick: () -> Unit) {
+              Button(
+                  onClick = onClick,
+                  modifier = Modifier.width(145.dp).height(62.dp),
+                  shape = RoundedCornerShape(32.dp),
+                  colors = ButtonDefaults.buttonColors(containerColor = color)
+              ) {
+                  Text(label, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+              }
+          }
+
+          @Composable
+          private fun ControlButton(
+              label: String,
+              selected: Boolean,
+              enabled: Boolean,
+              onClick: () -> Unit
+          ) {
+              Column(
+                  modifier = Modifier.width(92.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                  FilledTonalButton(
+                      onClick = onClick,
+                      enabled = enabled,
+                      modifier = Modifier.size(66.dp),
+                      shape = CircleShape,
+                      colors = ButtonDefaults.filledTonalButtonColors(
+                          containerColor = if (selected) Color(0xFF00A86B) else Color(0xFF263B59),
+                          contentColor = Color.White,
+                          disabledContainerColor = Color(0xFF1D2B40),
+                          disabledContentColor = Color(0xFF718096)
+                      )
+                  ) {
+                      Text(label.take(1), fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                  }
+                  Spacer(Modifier.height(5.dp))
+                  Text(label, color = if (enabled) Color.White else Color(0xFF718096),
+                      fontSize = 12.sp, textAlign = TextAlign.Center)
+              }
+          }
+
+          private fun formatDuration(seconds: Long): String {
+              val hours = seconds / 3600
+              val minutes = (seconds % 3600) / 60
+              val secs = seconds % 60
+              return if (hours > 0) "%d:%02d:%02d".format(hours, minutes, secs)
+              else "%02d:%02d".format(minutes, secs)
           }
           EOF
 
@@ -1305,5 +1625,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ODialer-MotoG85-v4
+          name: ODialer-MotoG85-v5-call-controls
           path: app/build/outputs/apk/debug/app-debug.apk
