@@ -964,6 +964,213 @@ jobs:
           }
           EOF
 
+      - name: Add ODialer theme settings
+        run: |
+          cat > app/src/main/java/com/motog85/odialer/ThemeEngine.kt <<'EOF'
+          package com.motog85.odialer
+
+          import android.content.Context
+
+          data class ODialerPalette(
+              val name: String,
+              val primary: Long,
+              val background: Long,
+              val text: Long
+          )
+
+          object ODialerThemes {
+              val palettes = listOf(
+                  ODialerPalette("Ocean Blue", 0xFF1677E8, 0xFFF5F8FF, 0xFF14243A),
+                  ODialerPalette("Emerald", 0xFF009B72, 0xFFF2FBF7, 0xFF12352B),
+                  ODialerPalette("Royal Purple", 0xFF7651D5, 0xFFF7F4FF, 0xFF2B2048),
+                  ODialerPalette("Sunset", 0xFFE46B38, 0xFFFFF7F1, 0xFF40251B),
+                  ODialerPalette("Rose", 0xFFD84F7B, 0xFFFFF5F8, 0xFF3E202B),
+                  ODialerPalette("Dark", 0xFF36C98F, 0xFF121820, 0xFFF1F5F9),
+                  ODialerPalette("AMOLED Black", 0xFF36C98F, 0xFF000000, 0xFFFFFFFF)
+              )
+
+              private const val PREFS = "odialer_customization"
+              private const val KEY_THEME = "theme"
+              private const val KEY_WALLPAPER = "wallpaper_uri"
+
+              fun getSelectedTheme(context: Context): String =
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                      .getString(KEY_THEME, "Ocean Blue") ?: "Ocean Blue"
+
+              fun saveTheme(context: Context, name: String) {
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                      .edit().putString(KEY_THEME, name).apply()
+              }
+
+              fun getWallpaper(context: Context): String? =
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                      .getString(KEY_WALLPAPER, null)
+
+              fun saveWallpaper(context: Context, uri: String) {
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                      .edit().putString(KEY_WALLPAPER, uri).apply()
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/motog85/odialer/CustomizationActivity.kt <<'EOF'
+          package com.motog85.odialer
+
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+
+          class CustomizationActivity : ComponentActivity() {
+              private val wallpaperPicker = registerForActivityResult(
+                  ActivityResultContracts.OpenDocument()
+              ) { uri: Uri? ->
+                  if (uri != null) {
+                      try {
+                          contentResolver.takePersistableUriPermission(
+                              uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                          )
+                      } catch (_: Exception) { }
+                      ODialerThemes.saveWallpaper(this, uri.toString())
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent {
+                      var selected by remember {
+                          mutableStateOf(ODialerThemes.getSelectedTheme(this))
+                      }
+                      val palette = ODialerThemes.palettes.firstOrNull { it.name == selected }
+                          ?: ODialerThemes.palettes.first()
+
+                      MaterialTheme {
+                          Column(
+                              modifier = Modifier.fillMaxSize()
+                                  .background(Color(palette.background)).padding(20.dp),
+                              verticalArrangement = Arrangement.spacedBy(12.dp)
+                          ) {
+                              TextButton(onClick = { finish() }) { Text("← Back") }
+                              Text("ODialer Settings", fontSize = 27.sp,
+                                  fontWeight = FontWeight.Bold, color = Color(palette.text))
+                              Text("Choose app colour theme", color = Color(palette.text))
+
+                              ODialerThemes.palettes.forEach { item ->
+                                  Row(
+                                      modifier = Modifier.fillMaxWidth()
+                                          .background(Color(item.background), RoundedCornerShape(14.dp))
+                                          .clickable {
+                                              selected = item.name
+                                              ODialerThemes.saveTheme(this@CustomizationActivity, item.name)
+                                          }.padding(14.dp),
+                                      verticalAlignment = Alignment.CenterVertically
+                                  ) {
+                                      Box(Modifier.size(22.dp).background(
+                                          Color(item.primary), RoundedCornerShape(50)))
+                                      Text(item.name, modifier = Modifier.weight(1f)
+                                          .padding(start = 12.dp), color = Color(item.text))
+                                      RadioButton(selected == item.name, onClick = {
+                                          selected = item.name
+                                          ODialerThemes.saveTheme(this@CustomizationActivity, item.name)
+                                      })
+                                  }
+                              }
+
+                              Spacer(Modifier.height(8.dp))
+                              Button(
+                                  onClick = { wallpaperPicker.launch(arrayOf("image/*")) },
+                                  modifier = Modifier.fillMaxWidth(),
+                                  colors = ButtonDefaults.buttonColors(
+                                      containerColor = Color(palette.primary)
+                                  )
+                              ) { Text("Choose wallpaper from Gallery") }
+                              Text(
+                                  if (ODialerThemes.getWallpaper(this@CustomizationActivity) != null)
+                                      "Gallery wallpaper saved"
+                                  else "No gallery wallpaper selected",
+                                  color = Color(palette.text), fontSize = 13.sp
+                              )
+                              Text(
+                                  "Theme is applied to the main dialer. Wallpaper selection is saved for the next call-screen integration.",
+                                  color = Color(palette.text), fontSize = 12.sp
+                              )
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          # Connect the settings screen and apply the selected palette to the main dialer.
+          main = Path("app/src/main/java/com/motog85/odialer/MainActivity.kt")
+          if not main.exists():
+              raise SystemExit("ERROR: MainActivity.kt not found")
+          code = main.read_text()
+
+          replacements = [
+              (
+                  '    private val setupDone = mutableStateOf(false)\n',
+                  '    private val setupDone = mutableStateOf(false)\n    private val selectedThemeName = mutableStateOf("Ocean Blue")\n'
+              ),
+              (
+                  '        setupDone.value = isDefaultDialer()\n\n        if (checkSelfPermission',
+                  '        setupDone.value = isDefaultDialer()\n        selectedThemeName.value = ODialerThemes.getSelectedTheme(this)\n\n        if (checkSelfPermission'
+              ),
+              (
+                  '            var page by remember { mutableStateOf("Dialer") }\n\n            val green = Color(0xFF00C967)\n            val dark = Color(0xFF152333)\n',
+                  '            var page by remember { mutableStateOf("Dialer") }\n            val palette = ODialerThemes.palettes.firstOrNull { it.name == selectedThemeName.value }\n                ?: ODialerThemes.palettes.first()\n\n            val green = Color(palette.primary)\n            val dark = Color(palette.text)\n'
+              ),
+              ('                    color = Color.White\n', '                    color = Color(palette.background)\n'),
+              (
+                  'TextButton(\n                                    onClick = { requestDefaultDialer() }\n                                ) {\n                                    Text("Default Phone", color = green)\n                                }',
+                  'Row(verticalAlignment = Alignment.CenterVertically) {\n                                    TextButton(onClick = {\n                                        startActivity(Intent(this@MainActivity, CustomizationActivity::class.java))\n                                    }) { Text("Settings", color = green) }\n                                    TextButton(onClick = { requestDefaultDialer() }) {\n                                        Text("Default Phone", color = green)\n                                    }\n                                }'
+              ),
+              (
+                  '        setupDone.value = isDefaultDialer()\n\n        if (setupDone.value) {',
+                  '        setupDone.value = isDefaultDialer()\n        selectedThemeName.value = ODialerThemes.getSelectedTheme(this)\n\n        if (setupDone.value) {'
+              )
+          ]
+          for old, new in replacements:
+              if old not in code:
+                  raise SystemExit("ERROR: MainActivity patch anchor not found: " + old[:90].replace("\\n", " "))
+              code = code.replace(old, new, 1)
+          main.write_text(code)
+
+          # Declare the settings activity in AndroidManifest.xml.
+          manifest = Path("app/src/main/AndroidManifest.xml")
+          ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
+          ns = "{http://schemas.android.com/apk/res/android}"
+          tree = ET.parse(manifest)
+          app = tree.getroot().find("application")
+          if app is None:
+              raise SystemExit("ERROR: application tag missing from manifest")
+          if not any(a.get(ns + "name") == ".CustomizationActivity" for a in app.findall("activity")):
+              ET.SubElement(app, "activity", {
+                  ns + "name": ".CustomizationActivity",
+                  ns + "exported": "false"
+              })
+          tree.write(manifest, encoding="utf-8", xml_declaration=True)
+          print("Theme settings created and connected to MainActivity")
+          PY
+
       - name: Create In-call service
         run: |
           cat > app/src/main/java/com/motog85/odialer/PhoneInCallService.kt <<'EOF'
